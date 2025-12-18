@@ -1,6 +1,6 @@
 """
 Backend API pour le système de conclusions médicales
-FastAPI + Supabase
+FastAPI + Supabase (via httpx)
 """
 
 from fastapi import FastAPI, HTTPException
@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import os
-from supabase import create_client, Client
+import httpx
 
 # ============= CONFIGURATION =============
 app = FastAPI(title="API Conclusions Médicales", version="1.0")
@@ -16,20 +16,25 @@ app = FastAPI(title="API Conclusions Médicales", version="1.0")
 # Configuration CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # En production, spécifier le domaine exact
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Connexion Supabase
+# Configuration Supabase
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("Variables d'environnement SUPABASE_URL et SUPABASE_KEY requises")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# Headers pour les requêtes Supabase
+SUPABASE_HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json"
+}
 
 
 # ============= MODÈLES PYDANTIC =============
@@ -100,31 +105,37 @@ def root():
 
 
 @app.get("/categories", response_model=List[Categorie])
-def get_categories():
+async def get_categories():
     """Récupère toutes les catégories"""
     try:
-        response = supabase.table("categories").select("*").order("ordre").execute()
-        return response.data
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{SUPABASE_URL}/rest/v1/categories?select=*&order=ordre.asc",
+                headers=SUPABASE_HEADERS
+            )
+            response.raise_for_status()
+            return response.json()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
 
 
 @app.get("/motifs", response_model=List[Motif])
-def get_motifs(categorie_id: str):
+async def get_motifs(categorie_id: str):
     """Récupère les motifs d'une catégorie"""
     try:
-        response = supabase.table("motifs")\
-            .select("*")\
-            .eq("categorie_id", categorie_id)\
-            .order("ordre")\
-            .execute()
-        return response.data
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{SUPABASE_URL}/rest/v1/motifs?select=*&categorie_id=eq.{categorie_id}&order=ordre.asc",
+                headers=SUPABASE_HEADERS
+            )
+            response.raise_for_status()
+            return response.json()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
 
 
 @app.post("/fusion", response_model=FusionResponse)
-def fusion_motifs(request: FusionRequest):
+async def fusion_motifs(request: FusionRequest):
     """
     Fusionne un motif principal avec des motifs secondaires
     Retourne les modules, ordonnances et codes CCAM fusionnés
@@ -134,17 +145,35 @@ def fusion_motifs(request: FusionRequest):
         
         # Récupération de tous les modules
         modules_data = {}
-        for motif_id in motifs_ids:
-            modules_response = supabase.table("modules")\
-                .select("*, bulles_info(*), propositions(*)")\
-                .eq("motif_id", motif_id)\
-                .execute()
-            
-            for module in modules_response.data:
-                type_module = module['type_module']
-                if type_module not in modules_data:
-                    modules_data[type_module] = []
-                modules_data[type_module].append(module)
+        async with httpx.AsyncClient() as client:
+            for motif_id in motifs_ids:
+                # Récupérer les modules
+                modules_response = await client.get(
+                    f"{SUPABASE_URL}/rest/v1/modules?select=*&motif_id=eq.{motif_id}",
+                    headers=SUPABASE_HEADERS
+                )
+                modules_response.raise_for_status()
+                modules = modules_response.json()
+                
+                for module in modules:
+                    # Récupérer les bulles pour ce module
+                    bulles_response = await client.get(
+                        f"{SUPABASE_URL}/rest/v1/bulles_info?select=*&module_id=eq.{module['id']}",
+                        headers=SUPABASE_HEADERS
+                    )
+                    module['bulles_info'] = bulles_response.json() if bulles_response.status_code == 200 else []
+                    
+                    # Récupérer les propositions pour ce module
+                    props_response = await client.get(
+                        f"{SUPABASE_URL}/rest/v1/propositions?select=*&module_id=eq.{module['id']}",
+                        headers=SUPABASE_HEADERS
+                    )
+                    module['propositions'] = props_response.json() if props_response.status_code == 200 else []
+                    
+                    type_module = module['type_module']
+                    if type_module not in modules_data:
+                        modules_data[type_module] = []
+                    modules_data[type_module].append(module)
         
         # Fusion des modules
         modules_fusionnes = []
@@ -171,37 +200,53 @@ def fusion_motifs(request: FusionRequest):
         
         # Récupération des ordonnances
         ordonnances = []
-        ordos_vues = set()  # Pour éviter les doublons
+        ordos_vues = set()
         
-        for motif_id in motifs_ids:
-            ordos_response = supabase.table("ordonnances")\
-                .select("*, ordonnances_bulles(*), ordonnances_propositions(*)")\
-                .eq("motif_id", motif_id)\
-                .order("ordre")\
-                .execute()
-            
-            for ordo in ordos_response.data:
-                # Clé unique : catégorie + titre
-                cle = f"{ordo['categorie_ordo']}_{ordo['titre']}"
-                if cle not in ordos_vues:
-                    ordos_vues.add(cle)
-                    ordonnances.append({
-                        "id": ordo['id'],
-                        "categorie_ordo": ordo['categorie_ordo'],
-                        "titre": ordo['titre'],
-                        "contenu": ordo['contenu'],
-                        "bulles": [
-                            {"mot": b['position_mot'], "info": b['texte_info']}
-                            for b in ordo.get('ordonnances_bulles', [])
-                        ],
-                        "propositions": [
-                            {
-                                "placeholder": p['champ_modifiable'],
-                                "suggestions": p['suggestions']
-                            }
-                            for p in ordo.get('ordonnances_propositions', [])
-                        ]
-                    })
+        async with httpx.AsyncClient() as client:
+            for motif_id in motifs_ids:
+                ordos_response = await client.get(
+                    f"{SUPABASE_URL}/rest/v1/ordonnances?select=*&motif_id=eq.{motif_id}&order=ordre.asc",
+                    headers=SUPABASE_HEADERS
+                )
+                ordos_response.raise_for_status()
+                ordos_list = ordos_response.json()
+                
+                for ordo in ordos_list:
+                    cle = f"{ordo['categorie_ordo']}_{ordo['titre']}"
+                    if cle not in ordos_vues:
+                        ordos_vues.add(cle)
+                        
+                        # Récupérer les bulles pour cette ordonnance
+                        bulles_response = await client.get(
+                            f"{SUPABASE_URL}/rest/v1/ordonnances_bulles?select=*&ordonnance_id=eq.{ordo['id']}",
+                            headers=SUPABASE_HEADERS
+                        )
+                        ordo_bulles = bulles_response.json() if bulles_response.status_code == 200 else []
+                        
+                        # Récupérer les propositions pour cette ordonnance
+                        props_response = await client.get(
+                            f"{SUPABASE_URL}/rest/v1/ordonnances_propositions?select=*&ordonnance_id=eq.{ordo['id']}",
+                            headers=SUPABASE_HEADERS
+                        )
+                        ordo_props = props_response.json() if props_response.status_code == 200 else []
+                        
+                        ordonnances.append({
+                            "id": ordo['id'],
+                            "categorie_ordo": ordo['categorie_ordo'],
+                            "titre": ordo['titre'],
+                            "contenu": ordo['contenu'],
+                            "bulles": [
+                                {"mot": b['position_mot'], "info": b['texte_info']}
+                                for b in ordo_bulles
+                            ],
+                            "propositions": [
+                                {
+                                    "placeholder": p['champ_modifiable'],
+                                    "suggestions": p['suggestions']
+                                }
+                                for p in ordo_props
+                            ]
+                        })
         
         # Tri des ordonnances par catégorie
         ordonnances.sort(key=lambda x: (x['categorie_ordo'], x['titre']))
@@ -210,20 +255,21 @@ def fusion_motifs(request: FusionRequest):
         codes_ccam = []
         codes_vus = set()
         
-        for motif_id in motifs_ids:
-            ccam_response = supabase.table("codes_ccam")\
-                .select("*")\
-                .eq("motif_id", motif_id)\
-                .order("ordre")\
-                .execute()
-            
-            for code in ccam_response.data:
-                if code['code'] not in codes_vus:
-                    codes_vus.add(code['code'])
-                    codes_ccam.append({
-                        "code": code['code'],
-                        "libelle": code['libelle']
-                    })
+        async with httpx.AsyncClient() as client:
+            for motif_id in motifs_ids:
+                ccam_response = await client.get(
+                    f"{SUPABASE_URL}/rest/v1/codes_ccam?select=*&motif_id=eq.{motif_id}&order=ordre.asc",
+                    headers=SUPABASE_HEADERS
+                )
+                if ccam_response.status_code == 200:
+                    ccam_list = ccam_response.json()
+                    for code in ccam_list:
+                        if code['code'] not in codes_vus:
+                            codes_vus.add(code['code'])
+                            codes_ccam.append({
+                                "code": code['code'],
+                                "libelle": code['libelle']
+                            })
         
         return {
             "modules": modules_fusionnes,
@@ -243,21 +289,18 @@ def fusionner_module(type_key: str, titre: str, icon: str, modules: List[Dict]) 
     """
     
     if type_key == 'diagnostic':
-        # Concaténation avec séparation par phrases
         contenus = []
         bulles_map = {}
         propositions_map = {}
         
         for module in modules:
             contenu = module['contenu'].strip()
-            if contenu and contenu not in contenus:  # Éviter doublons
+            if contenu and contenu not in contenus:
                 contenus.append(contenu)
             
-            # Bulles
             for bulle in module.get('bulles_info', []):
                 bulles_map[bulle['position_mot']] = bulle['texte_info']
             
-            # Propositions
             for prop in module.get('propositions', []):
                 if prop['champ_modifiable'] not in propositions_map:
                     propositions_map[prop['champ_modifiable']] = prop['suggestions']
@@ -278,10 +321,8 @@ def fusionner_module(type_key: str, titre: str, icon: str, modules: List[Dict]) 
         }
     
     elif type_key == 'signes_gravite':
-        # Union des signes (liste à puces)
         signes = set()
         for module in modules:
-            # Séparer par ligne ou par virgule
             contenu = module['contenu']
             for signe in contenu.split('\n'):
                 signe = signe.strip().lstrip('-•▪').strip()
@@ -300,23 +341,19 @@ def fusionner_module(type_key: str, titre: str, icon: str, modules: List[Dict]) 
         }
     
     elif type_key == 'conduite_tenir':
-        # Format numéroté
         actions = []
         for module in modules:
             contenu = module['contenu']
-            # Séparer les actions
             for ligne in contenu.split('\n'):
                 ligne = ligne.strip().lstrip('0123456789.-) ').strip()
                 if ligne and ligne not in actions:
                     actions.append(ligne)
         
-        # Numérotation
         contenu_fusionne = "\n".join(
             f"{i+1} - {action}" 
             for i, action in enumerate(actions)
         )
         
-        # Fusionner bulles et propositions
         bulles_map = {}
         propositions_map = {}
         for module in modules:
@@ -342,7 +379,6 @@ def fusionner_module(type_key: str, titre: str, icon: str, modules: List[Dict]) 
         }
     
     else:
-        # Fusion standard (conseils, suivi, etc.)
         contenus = []
         bulles_map = {}
         propositions_map = {}
@@ -377,12 +413,16 @@ def fusionner_module(type_key: str, titre: str, icon: str, modules: List[Dict]) 
 # ============= ROUTE DE TEST =============
 
 @app.get("/health")
-def health_check():
+async def health_check():
     """Vérification de l'état de l'API"""
     try:
-        # Test connexion Supabase
-        supabase.table("categories").select("count").limit(1).execute()
-        return {"status": "healthy", "database": "connected"}
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{SUPABASE_URL}/rest/v1/categories?select=count&limit=1",
+                headers=SUPABASE_HEADERS
+            )
+            response.raise_for_status()
+            return {"status": "healthy", "database": "connected"}
     except Exception as e:
         return {"status": "unhealthy", "error": str(e)}
 
